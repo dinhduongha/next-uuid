@@ -1,27 +1,52 @@
-CREATE OR REPLACE FUNCTION next_uuid(OUT result uuid) AS $$
-DECLARE
-    now_micros bigint;
-    second_rand bigint;
-    hex_value text;
-    shard_id int:=1;
-    version int:=7;
+DO $$
 BEGIN
-    -- Can use clock_timestamp() / statement_timestamp() / transaction_timestamp() / current_timestamp
-    select (extract(epoch from current_timestamp)*1000000)::BIGINT INTO now_micros;
-    -- Uncomment one of below lines to ignore sharding.
-    -- shard_id := now_micros%1000;
-    -- select ((random() * 10^6)::INT) INTO shard_id;
+    IF (SELECT current_setting('server_version_num')::integer < 180000) THEN
+    -- CREATE FUNCTION cannot appear directly inside PL/pgSQL block,
+    -- so we EXECUTE the CREATE FUNCTION statement as a string.
+    EXECUTE $create$
+    CREATE OR REPLACE FUNCTION uuidv7(OUT result uuid) AS $inner$
+    DECLARE
+        now_micros bigint;
+        second_rand bigint;
+        hex_value text;
+        shard_id int:=1;
+        version int:=7;
+    BEGIN
+        -- Can use clock_timestamp() / statement_timestamp() / transaction_timestamp() / current_timestamp
+        select (extract(epoch from current_timestamp)*1000000)::BIGINT INTO now_micros;
+        -- Uncomment one of below lines to ignore sharding.
+        -- shard_id := now_micros%1000;
+        -- select ((random() * 10^6)::INT) INTO shard_id;
 
-    -- [milliseconds(6 bytes) + microseconds(12 bits) + shard(4 bits) + random(8 bytes)]
-    -- select ((random() * 10^18)::BIGINT) INTO second_rand;
-    -- hex_value := LPAD(TO_HEX(now_micros/1000), 12, '0')||LPAD(TO_HEX(now_micros%1000), 3, '0')||LPAD(TO_HEX(shard_id), 1, '0')||LPAD(TO_HEX(second_rand), 16, '0'); 
+        -- [milliseconds(6 bytes) + microseconds(12 bits) + shard(4 bits) + random(8 bytes)]
+        -- select ((random() * 10^18)::BIGINT) INTO second_rand;
+        -- hex_value := LPAD(TO_HEX(now_micros/1000), 12, '0')||LPAD(TO_HEX(now_micros%1000), 3, '0')||LPAD(TO_HEX(shard_id), 1, '0')||LPAD(TO_HEX(second_rand), 16, '0'); 
 
-    -- UUID v7: [milliseconds(6 bytes) + version(4 bits) + microseconds/shard(12 bits)+ var(2 bits) + random(62 bits)]
-    select (((random() * 10^18)::BIGINT) & x'3FFFFFFFFFFFFFFF'::BIGINT) |x'8000000000000000'::BIGINT INTO second_rand;
-    hex_value := LPAD(TO_HEX(now_micros/1000), 12, '0')||LPAD(TO_HEX(version), 1, '0')||LPAD(TO_HEX(shard_id), 3, '0')||LPAD(TO_HEX(second_rand), 16, '0');
-    result := CAST(hex_value AS UUID);
-    -- TEST PERFOMANCE
-    -- EXPLAIN ANALYZE
-    -- SELECT next_uuid() FROM generate_series(1,100000);
-END;
-$$ LANGUAGE PLPGSQL;
+        -- UUID v7: [milliseconds(6 bytes) + version(4 bits) + microseconds/shard(12 bits)+ var(2 bits) + random(62 bits)]
+        -- select (((random() * 10^18)::BIGINT) & x'3FFFFFFFFFFFFFFF'::BIGINT) |x'8000000000000000'::BIGINT INTO second_rand;
+        -- hex_value := LPAD(TO_HEX(now_micros/1000), 12, '0')||LPAD(TO_HEX(version), 1, '0')||LPAD(TO_HEX(shard_id), 3, '0')||LPAD(TO_HEX(second_rand), 16, '0');
+        
+        -- second_rand: mask with 0x3FFFFFFFFFFFFFFF and set MSB to 1 (variant bits)
+        -- 0x3FFFFFFFFFFFFFFF = 4611686018427387903
+        -- 0x8000000000000000 as signed bigint is -9223372036854775808 (two's complement)
+
+        SELECT (
+            (((random() * 10^18)::bigint) & 4611686018427387903)   -- keep lower 62 bits
+            | (-9223372036854775808::bigint)                       -- set the MSB (variant)
+        ) INTO second_rand;
+
+        hex_value := LPAD(TO_HEX(now_micros/1000), 12, '0')
+                     || LPAD(TO_HEX(version), 1, '0')
+                     || LPAD(TO_HEX(shard_id), 3, '0')
+                     || LPAD(TO_HEX(second_rand), 16, '0');
+
+        result := CAST(hex_value AS UUID);
+        -- TEST PERFOMANCE
+        -- EXPLAIN ANALYZE
+        -- SELECT uuidv7() FROM generate_series(1,100000);
+    END;
+    $inner$ LANGUAGE PLPGSQL;
+    $create$;
+    END IF;
+END
+$$;
